@@ -10,12 +10,31 @@ use anyhow::{Context, Result};
 use tao::dpi::LogicalSize;
 use tao::event_loop::EventLoopWindowTarget;
 use tao::window::{Window, WindowBuilder, WindowId};
-use wry::{WebContext, WebView, WebViewBuilder};
+use wry::{WebContext, WebView, WebViewBuilder, WebViewBuilderExtWindows};
 
 const LOGIN_URL: &str = "https://claude.ai/login";
 const COOKIE_URL: &str = "https://claude.ai";
-const EDGE_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
-                       (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0";
+
+/// wry's default WebView2 flags, plus `UserAgentClientHint` so the webview stops sending
+/// `Sec-CH-UA: "Microsoft Edge WebView2"`. Google's sign-in refuses embedded browsers, and
+/// that header (or a user agent that disagrees with it) is how it spots them.
+const BROWSER_ARGS: &str =
+    "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,UserAgentClientHint";
+
+/// A desktop Edge user agent for the installed WebView2 version, e.g. `Edg/157.0.0.0`.
+/// It has to match the real engine: a stale hard-coded version is itself a red flag.
+fn edge_user_agent() -> Option<String> {
+    let version = wry::webview_version().ok()?;
+    let major = version.split('.').next().filter(|m| m.parse::<u32>().is_ok())?;
+    Some(edge_user_agent_for(major))
+}
+
+fn edge_user_agent_for(major: &str) -> String {
+    format!(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) \
+         Chrome/{major}.0.0.0 Safari/537.36 Edg/{major}.0.0.0"
+    )
+}
 
 pub struct LoginWindow {
     // Field order is drop order: the webview must go before its window.
@@ -36,11 +55,15 @@ impl LoginWindow {
         // Own browser profile, so the person's other browsers are untouched and the
         // sign-in survives restarts (re-login is usually one click).
         let mut context = WebContext::new(Some(config::data_dir().join("webview")));
-        let webview = WebViewBuilder::new_with_web_context(&mut context)
+        let mut builder = WebViewBuilder::new_with_web_context(&mut context)
             .with_url(LOGIN_URL)
-            // Present as regular desktop Edge. Google's sign-in rejects some embedded
-            // browsers based on the user agent.
-            .with_user_agent(EDGE_UA)
+            .with_additional_browser_args(BROWSER_ARGS);
+        // Present as regular desktop Edge (WebView2 is the same engine). If the version
+        // can't be read, keep WebView2's own user agent rather than guess one.
+        if let Some(ua) = edge_user_agent() {
+            builder = builder.with_user_agent(&ua);
+        }
+        let webview = builder
             .build(&window)
             .context("starting WebView2 (is the WebView2 runtime installed?)")?;
         Ok(Self { webview, _context: context, window, reject })
@@ -65,4 +88,16 @@ impl LoginWindow {
 /// WebView2 can hold files open for a moment after its window closes.
 pub fn clear_profile() {
     let _ = std::fs::remove_dir_all(config::data_dir().join("webview"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_agent_uses_the_engine_version() {
+        let ua = edge_user_agent_for("157");
+        assert!(ua.contains("Chrome/157.0.0.0 Safari/537.36 Edg/157.0.0.0"));
+        assert!(!ua.contains("  "));
+    }
 }
