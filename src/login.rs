@@ -10,7 +10,17 @@ use anyhow::{Context, Result};
 use tao::dpi::LogicalSize;
 use tao::event_loop::EventLoopWindowTarget;
 use tao::window::{Window, WindowBuilder, WindowId};
-use wry::{WebContext, WebView, WebViewBuilder, WebViewBuilderExtWindows};
+use wry::{NewWindowResponse, WebContext, WebView, WebViewBuilder, WebViewBuilderExtWindows};
+
+/// Identity providers claude.ai offers on its login page.
+const SIGN_IN_HOSTS: &[&str] = &["accounts.google.com", "appleid.apple.com"];
+
+/// Whether a popup URL is a sign-in page we should let open.
+fn is_sign_in_popup(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else { return false };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    SIGN_IN_HOSTS.contains(&host)
+}
 
 const LOGIN_URL: &str = "https://claude.ai/login";
 const COOKIE_URL: &str = "https://claude.ai";
@@ -57,7 +67,18 @@ impl LoginWindow {
         let mut context = WebContext::new(Some(config::data_dir().join("webview")));
         let mut builder = WebViewBuilder::new_with_web_context(&mut context)
             .with_url(LOGIN_URL)
-            .with_additional_browser_args(BROWSER_ARGS);
+            .with_additional_browser_args(BROWSER_ARGS)
+            // "Continue with Google/Apple" open a popup and hand the result back through
+            // `window.opener`. Without a handler wry blocks every popup, and claude.ai then
+            // says "There was an error logging you in". Let WebView2 open sign-in popups
+            // itself, which keeps the opener link; anything else stays blocked.
+            .with_new_window_req_handler(|url, _| {
+                if is_sign_in_popup(&url) {
+                    NewWindowResponse::Allow
+                } else {
+                    NewWindowResponse::Deny
+                }
+            });
         // Present as regular desktop Edge (WebView2 is the same engine). If the version
         // can't be read, keep WebView2's own user agent rather than guess one.
         if let Some(ua) = edge_user_agent() {
@@ -99,5 +120,14 @@ mod tests {
         let ua = edge_user_agent_for("157");
         assert!(ua.contains("Chrome/157.0.0.0 Safari/537.36 Edg/157.0.0.0"));
         assert!(!ua.contains("  "));
+    }
+
+    #[test]
+    fn only_sign_in_popups_are_allowed() {
+        assert!(is_sign_in_popup("https://accounts.google.com/o/oauth2/v2/auth?client_id=x"));
+        assert!(is_sign_in_popup("https://appleid.apple.com/auth/authorize"));
+        assert!(!is_sign_in_popup("http://accounts.google.com/"));
+        assert!(!is_sign_in_popup("https://accounts.google.com.evil.example/"));
+        assert!(!is_sign_in_popup("https://www.anthropic.com/legal/privacy"));
     }
 }
