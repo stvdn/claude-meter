@@ -1,4 +1,9 @@
+// Release builds are GUI apps (no console window behind the tray icon). The command-line
+// modes attach to the terminal they were started from instead.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod api;
+mod app;
 mod autostart;
 mod badge;
 mod config;
@@ -17,15 +22,48 @@ use tao::platform::run_return::EventLoopExtRunReturn;
 fn main() {
     let arg = std::env::args().nth(1);
     match arg.as_deref() {
-        Some("--once") => std::process::exit(run_once()),
+        None => {
+            if !single_instance() {
+                return; // Already running: its tray icon is the one to use.
+            }
+            app::run();
+        }
+        Some("--once") => {
+            attach_console();
+            std::process::exit(run_once())
+        }
         Some("--logout") => {
+            attach_console();
             secrets::clear();
             login::clear_profile();
             println!("Signed out.");
         }
-        _ => {
-            println!("usage: claude-meter [--once | --logout]");
+        Some(_) => {
+            attach_console();
+            println!("usage: claude-meter [--once | --logout]\n  (no arguments: run in the system tray)");
         }
+    }
+}
+
+/// Hold a named mutex for the life of the process; `false` if another copy already has it.
+fn single_instance() -> bool {
+    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+    let name: Vec<u16> = "Local\\claude-meter-single-instance\0".encode_utf16().collect();
+    // SAFETY: valid NUL-terminated name; the handle is deliberately never closed, so the
+    // mutex lives exactly as long as this process.
+    unsafe {
+        let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+        !handle.is_null() && GetLastError() != ERROR_ALREADY_EXISTS
+    }
+}
+
+/// In a release (GUI) build, print to the terminal that launched us, if any.
+fn attach_console() {
+    #[cfg(not(debug_assertions))]
+    // SAFETY: plain Win32 call with a constant argument; failure just means no console.
+    unsafe {
+        windows_sys::Win32::System::Console::AttachConsole(windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS);
     }
 }
 
