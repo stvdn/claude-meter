@@ -196,6 +196,23 @@ where
     lines.join("\n")
 }
 
+/// Menu line for one window: `"Session 42% · Resets in 2h 14m"`.
+pub fn window_line<Tz: TimeZone>(label: &str, w: &Window, now: DateTime<Utc>, tz: &Tz, weekly: bool) -> String
+where
+    Tz::Offset: Display,
+{
+    format!("{label} {} · {}", percent_label(w.percent), reset_line(w, now, tz, weekly))
+}
+
+/// `"This week: Claude Code 88% · Cowork 12%"`, or `None` when there's nothing to show.
+pub fn breakdown_line(shares: &[Share]) -> Option<String> {
+    if shares.is_empty() {
+        return None;
+    }
+    let parts: Vec<String> = shares.iter().map(|s| format!("{} {}%", s.name, s.percent)).collect();
+    Some(format!("This week: {}", parts.join(" · ")))
+}
+
 /// Wait before retrying after `failures` consecutive errors: 30 s, 60 s, 120 s ... capped at 10 min.
 pub fn backoff(failures: u32) -> Duration {
     let secs = 30u64.saturating_mul(1u64 << failures.saturating_sub(1).min(10));
@@ -313,6 +330,16 @@ mod tests {
             usage.others.push(usage.others[0].clone());
         }
         assert!(tooltip(&usage, now, &utc).chars().count() < 127);
+    }
+
+    #[test]
+    fn breakdown_lines() {
+        let shares = vec![
+            Share { name: "Claude Code".into(), percent: 88 },
+            Share { name: "Cowork".into(), percent: 12 },
+        ];
+        assert_eq!(breakdown_line(&shares).unwrap(), "This week: Claude Code 88% · Cowork 12%");
+        assert_eq!(breakdown_line(&[]), None);
     }
 
     #[test]
