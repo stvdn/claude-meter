@@ -58,7 +58,7 @@ pub struct LoginWindow {
 impl LoginWindow {
     pub fn open<T: 'static>(target: &EventLoopWindowTarget<T>, reject: Option<String>) -> Result<Self> {
         let window = WindowBuilder::new()
-            .with_title("Sign in to Claude · claude-meter (if Google refuses, use Continue with email)")
+            .with_title("Sign in to Claude · claude-meter")
             .with_inner_size(LogicalSize::new(480.0, 720.0))
             .build(target)
             .context("creating the sign-in window")?;

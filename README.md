@@ -17,8 +17,6 @@ cargo run -- --once     # sign in if needed, print current usage once
 cargo run -- --logout   # forget the saved session
 ```
 
-If Google sign-in is refused inside the login window, use **Continue with email** on the claude.ai page instead.
-
 ## How it works
 claude.ai's Settings → Usage page reads `GET /api/organizations/{org}/usage?via=plan`. claude-meter calls the same endpoint with your session cookie. It's an undocumented endpoint, so parsing is tolerant and may need updates if claude.ai changes it.
 
