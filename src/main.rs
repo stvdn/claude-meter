@@ -2,6 +2,7 @@ mod api;
 mod config;
 mod login;
 mod model;
+mod render;
 mod secrets;
 
 use api::{ApiError, Client};
