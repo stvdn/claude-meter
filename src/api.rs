@@ -59,13 +59,13 @@ pub fn parse_usage(body: &str) -> Result<Usage, ApiError> {
     if session.is_none() && weekly.is_none() {
         return Err(ApiError::Parse("no five_hour or seven_day window in response".into()));
     }
-    Ok(Usage { session, weekly })
+    Ok(Usage { session, weekly, ..Usage::default() })
 }
 
 /// A key that's present but `null` means the window hasn't started yet, so it's 0% used.
 fn parse_window(v: &Value, key: &str) -> Option<Window> {
     match v.get(key)? {
-        Value::Null => Some(Window { percent: 0.0, resets_at: None }),
+        Value::Null => Some(Window::default()),
         Value::Object(obj) => {
             let percent = obj.get("utilization").and_then(Value::as_f64).unwrap_or(0.0) as f32;
             let resets_at = obj
@@ -73,7 +73,7 @@ fn parse_window(v: &Value, key: &str) -> Option<Window> {
                 .and_then(Value::as_str)
                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
                 .map(|d| d.with_timezone(&Utc));
-            Some(Window { percent, resets_at })
+            Some(Window { percent, resets_at, severity: None })
         }
         _ => None,
     }
@@ -176,7 +176,7 @@ mod tests {
     #[test]
     fn null_window_means_not_started() {
         let u = parse_usage(r#"{"five_hour": null, "seven_day": {"utilization": 5}}"#).unwrap();
-        assert_eq!(u.session, Some(Window { percent: 0.0, resets_at: None }));
+        assert_eq!(u.session, Some(Window::default()));
         assert_eq!(u.weekly.unwrap().resets_at, None);
     }
 
