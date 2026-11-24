@@ -3,7 +3,7 @@
 //! Text uses a font that ships with Windows (Segoe UI), read from disk once, so the
 //! binary carries no font. If no font can be loaded the pictures still draw, without text.
 
-use crate::model::{Level, Usage};
+use crate::model::{Level, Usage, percent_label};
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont, point};
 use std::sync::OnceLock;
 use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Rect, Transform};
@@ -42,6 +42,10 @@ pub fn level_color(level: Level) -> Rgb {
 
 const GRAY: Rgb = Rgb(0x6b, 0x6b, 0x6b);
 const WHITE: Rgb = Rgb(0xff, 0xff, 0xff);
+const BADGE_BG: Rgb = Rgb(0x1f, 0x1e, 0x1d);
+const BADGE_TEXT: Rgb = Rgb(0xf2, 0xf0, 0xeb);
+const BADGE_MUTED: Rgb = Rgb(0x9a, 0x97, 0x90);
+const TRACK: Rgb = Rgb(0x3a, 0x38, 0x35);
 
 fn font() -> Option<&'static FontVec> {
     static FONT: OnceLock<Option<FontVec>> = OnceLock::new();
@@ -194,6 +198,62 @@ fn number(percent: f32) -> String {
     format!("{}", percent.clamp(0.0, 999.0).round() as i64)
 }
 
+/// One row of the badge.
+pub struct BadgeRow<'a> {
+    pub label: &'a str,
+    pub percent: f32,
+    pub level: Level,
+}
+
+/// Badge layout in logical pixels for `rows` (normal) or one line (compact).
+pub fn badge_size(compact: bool, rows: usize) -> (f64, f64) {
+    if compact { (112.0, 26.0) } else { (176.0, 12.0 + 20.0 * rows.max(1) as f64) }
+}
+
+/// Draw the badge into 0x00RRGGBB pixels (softbuffer's format) at `scale`.
+pub fn badge(width: u32, height: u32, scale: f32, rows: &[BadgeRow], compact: bool, stale: bool, note: Option<&str>) -> Vec<u32> {
+    let mut pm = Pixmap::new(width.max(1), height.max(1)).expect("non-zero");
+    let (w, h) = (width as f32, height as f32);
+    pm.fill(Color::from_rgba8(BADGE_BG.0, BADGE_BG.1, BADGE_BG.2, 255));
+    let u = |v: f32| v * scale;
+
+    if let Some(text) = note.filter(|_| rows.is_empty()) {
+        let size = fit(text, u(12.0), w - u(16.0));
+        draw_text(&mut pm, text, u(8.0), (h - size * 1.2) / 2.0, size, &BADGE_MUTED);
+    } else if compact {
+        let text: Vec<String> = rows.iter().map(|r| format!("{} {}", &r.label[..1], percent_label(r.percent))).collect();
+        let text = text.join("  ");
+        let size = fit(&text, u(13.0), w - u(22.0));
+        let dot = rows.iter().map(|r| r.level).max().unwrap_or(Level::Ok);
+        let color = if stale { GRAY } else { level_color(dot) };
+        rounded_rect(&mut pm, u(8.0), h / 2.0 - u(4.0), u(8.0), u(8.0), u(4.0), &color, 255);
+        draw_text(&mut pm, &text, u(22.0), (h - size * 1.25) / 2.0, size, &BADGE_TEXT);
+    } else {
+        for (i, r) in rows.iter().enumerate() {
+            let y = u(7.0 + 20.0 * i as f32);
+            let label_size = u(12.0);
+            draw_text(&mut pm, r.label, u(10.0), y + u(1.0), label_size, &BADGE_MUTED);
+            let pct = percent_label(r.percent);
+            let pct_w = text_width(&pct, label_size);
+            draw_text(&mut pm, &pct, w - u(10.0) - pct_w, y + u(1.0), label_size, &BADGE_TEXT);
+            let (bx, bw, bh) = (u(62.0), w - u(62.0) - u(48.0), u(6.0));
+            let by = y + u(8.0);
+            let color = if stale { GRAY } else { level_color(r.level) };
+            rounded_rect(&mut pm, bx, by, bw, bh, bh / 2.0, &TRACK, 255);
+            let fill = bw * (r.percent.clamp(0.0, 100.0) / 100.0);
+            rounded_rect(&mut pm, bx, by, fill.max(bh), bh, bh / 2.0, &color, 255);
+        }
+    }
+
+    pm.pixels()
+        .iter()
+        .map(|p| {
+            let c = p.demultiply();
+            (c.red() as u32) << 16 | (c.green() as u32) << 8 | c.blue() as u32
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,6 +279,14 @@ mod tests {
         // A pixel near the corner but inside the rounding, away from the digits.
         let i = (8 * 32 + 2) * 4;
         assert_eq!((px[i], px[i + 1], px[i + 2]), (c.0, c.1, c.2));
+    }
+
+    #[test]
+    fn badge_fills_the_buffer() {
+        let rows = [BadgeRow { label: "Session", percent: 42.0, level: Level::Ok }];
+        let (w, h) = (176, 32);
+        assert_eq!(badge(w, h, 1.0, &rows, false, false, None).len(), (w * h) as usize);
+        assert_eq!(badge(w, h, 1.0, &[], true, false, Some("Signed out")).len(), (w * h) as usize);
     }
 
     #[test]
