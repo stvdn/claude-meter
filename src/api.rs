@@ -4,7 +4,7 @@
 //! not a public, documented API, so parsing is deliberately tolerant: unknown fields
 //! are ignored and a missing window becomes `None` instead of an error.
 
-use crate::model::{Usage, Window};
+use crate::model::{Limit, Share, Usage, Window, parse_severity};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::time::Duration;
@@ -51,15 +51,37 @@ pub fn classify(status: u16, cf_mitigated: bool, body: &str) -> Result<(), ApiEr
 }
 
 /// Parse `/api/organizations/{id}/usage`. Expected shape (extra fields are ignored):
-/// `{"five_hour": {"utilization": 42.0, "resets_at": "2026-...Z"}, "seven_day": {...}}`
+/// ```text
+/// {"five_hour": {"utilization": 42.0, "resets_at": "2026-...Z"}, "seven_day": {...},
+///  "limits": [{"kind": "session", "percent": 42, "severity": "normal", "resets_at": ...}, ...],
+///  "seven_day_breakdown": {"rows": [{"display_name": "Claude Code", "percent": 88}, ...]}}
+/// ```
+/// `five_hour`/`seven_day` give the precise percentages; `limits` adds claude.ai's severity
+/// and any extra limits (e.g. a weekly cap on one model). Either source alone is enough.
 pub fn parse_usage(body: &str) -> Result<Usage, ApiError> {
     let v: Value = serde_json::from_str(body).map_err(|e| ApiError::Parse(e.to_string()))?;
-    let session = parse_window(&v, "five_hour");
-    let weekly = parse_window(&v, "seven_day");
+    let mut limits = parse_limits(&v);
+    let mut take = |kind: &str| limits.iter().position(|l| l.kind == kind).map(|i| limits.remove(i).window);
+    let session = merge(parse_window(&v, "five_hour"), take("session"));
+    let weekly = merge(parse_window(&v, "seven_day"), take("weekly_all"));
     if session.is_none() && weekly.is_none() {
-        return Err(ApiError::Parse("no five_hour or seven_day window in response".into()));
+        return Err(ApiError::Parse("no session or weekly limit in response".into()));
     }
-    Ok(Usage { session, weekly, ..Usage::default() })
+    Ok(Usage { session, weekly, others: limits, breakdown: parse_breakdown(&v) })
+}
+
+/// Prefer the dedicated window's numbers, but keep the `limits` entry's severity.
+fn merge(window: Option<Window>, limit: Option<Window>) -> Option<Window> {
+    match (window, limit) {
+        (Some(w), Some(l)) => Some(Window { severity: l.severity, resets_at: w.resets_at.or(l.resets_at), ..w }),
+        (w, l) => w.or(l),
+    }
+}
+
+fn parse_time(v: Option<&Value>) -> Option<DateTime<Utc>> {
+    v.and_then(Value::as_str)
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&Utc))
 }
 
 /// A key that's present but `null` means the window hasn't started yet, so it's 0% used.
@@ -68,15 +90,46 @@ fn parse_window(v: &Value, key: &str) -> Option<Window> {
         Value::Null => Some(Window::default()),
         Value::Object(obj) => {
             let percent = obj.get("utilization").and_then(Value::as_f64).unwrap_or(0.0) as f32;
-            let resets_at = obj
-                .get("resets_at")
-                .and_then(Value::as_str)
-                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map(|d| d.with_timezone(&Utc));
-            Some(Window { percent, resets_at, severity: None })
+            Some(Window { percent, resets_at: parse_time(obj.get("resets_at")), severity: None })
         }
         _ => None,
     }
+}
+
+/// The `limits` list. Entries without a `kind` are skipped; a missing list is empty.
+fn parse_limits(v: &Value) -> Vec<Limit> {
+    let Some(items) = v.get("limits").and_then(Value::as_array) else { return Vec::new() };
+    items
+        .iter()
+        .filter_map(|l| {
+            let kind = l.get("kind").and_then(Value::as_str).filter(|k| !k.is_empty())?;
+            let percent = l
+                .get("percent")
+                .or_else(|| l.get("utilization"))
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0) as f32;
+            let severity = l.get("severity").and_then(Value::as_str).and_then(parse_severity);
+            let window = Window { percent, resets_at: parse_time(l.get("resets_at")), severity };
+            Some(Limit { kind: kind.to_string(), window })
+        })
+        .collect()
+}
+
+/// `seven_day_breakdown.rows`: each product's share of this week's usage, largest first.
+fn parse_breakdown(v: &Value) -> Vec<Share> {
+    let Some(rows) = v.pointer("/seven_day_breakdown/rows").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut shares: Vec<Share> = rows
+        .iter()
+        .filter_map(|r| {
+            let name = r.get("display_name").or_else(|| r.get("key")).and_then(Value::as_str)?;
+            let percent = r.get("percent").and_then(Value::as_f64)?.clamp(0.0, 100.0).round() as u8;
+            (percent > 0).then(|| Share { name: name.to_string(), percent })
+        })
+        .collect();
+    shares.sort_by(|a, b| b.percent.cmp(&a.percent));
+    shares
 }
 
 /// Parse `/api/organizations` and pick the org to read usage from.
@@ -157,6 +210,7 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Level;
 
     #[test]
     fn parses_both_windows() {
@@ -178,6 +232,66 @@ mod tests {
         let u = parse_usage(r#"{"five_hour": null, "seven_day": {"utilization": 5}}"#).unwrap();
         assert_eq!(u.session, Some(Window::default()));
         assert_eq!(u.weekly.unwrap().resets_at, None);
+    }
+
+    /// Trimmed from a real response (2026-11-23).
+    const REAL: &str = r#"{
+        "five_hour": {"utilization": 19.0, "resets_at": "2026-11-23T23:40:00.999428+00:00", "limit_dollars": null},
+        "seven_day": {"utilization": 4.0, "resets_at": "2026-11-29T19:00:00.999453+00:00"},
+        "seven_day_opus": null,
+        "limits": [
+            {"kind": "session", "group": "session", "percent": 19, "severity": "normal",
+             "resets_at": "2026-11-23T23:40:00.999428+00:00", "scope": null, "is_active": true},
+            {"kind": "weekly_all", "group": "weekly", "percent": 4, "severity": "normal",
+             "resets_at": "2026-11-29T19:00:00.999453+00:00", "scope": null, "is_active": false}
+        ],
+        "seven_day_breakdown": {"rows": [
+            {"key": "claude_code", "display_name": "Claude Code", "percent": 88, "percent_of_limit": 4},
+            {"key": "chat", "display_name": "Chats", "percent": 0, "percent_of_limit": 0},
+            {"key": "cowork", "display_name": "Cowork", "percent": 12, "percent_of_limit": 0}
+        ]}
+    }"#;
+
+    #[test]
+    fn parses_real_response_with_limits() {
+        let u = parse_usage(REAL).unwrap();
+        let s = u.session.unwrap();
+        assert_eq!((s.percent, s.severity), (19.0, Some(Level::Ok)));
+        assert_eq!(u.weekly.unwrap().percent, 4.0);
+        assert!(u.others.is_empty(), "session and weekly_all are not repeated as extras");
+        assert_eq!(
+            u.breakdown,
+            vec![Share { name: "Claude Code".into(), percent: 88 }, Share { name: "Cowork".into(), percent: 12 }]
+        );
+    }
+
+    #[test]
+    fn extra_limits_and_severity() {
+        let body = r#"{
+            "five_hour": {"utilization": 30.0},
+            "limits": [
+                {"kind": "session", "percent": 30, "severity": "critical"},
+                {"kind": "weekly_opus", "percent": 71.5, "severity": "warning", "resets_at": "2026-11-30T09:00:00Z"},
+                {"percent": 5},
+                {"kind": "weekly_all", "percent": 40, "severity": "something_new"}
+            ]
+        }"#;
+        let u = parse_usage(body).unwrap();
+        assert_eq!(u.session.as_ref().unwrap().level(), Level::Critical);
+        // No seven_day object: the weekly limit comes from the list alone.
+        let w = u.weekly.unwrap();
+        assert_eq!((w.percent, w.severity), (40.0, None));
+        assert_eq!(u.others.len(), 1);
+        assert_eq!(u.others[0].label(), "Week · Opus");
+        assert_eq!(u.others[0].window.level(), Level::Warn);
+        assert!(u.others[0].window.resets_at.is_some());
+    }
+
+    #[test]
+    fn limits_alone_are_enough() {
+        let u = parse_usage(r#"{"limits": [{"kind": "session", "percent": 12}]}"#).unwrap();
+        assert_eq!(u.session.unwrap().percent, 12.0);
+        assert!(u.weekly.is_none());
     }
 
     #[test]
