@@ -1,4 +1,5 @@
 mod api;
+mod autostart;
 mod config;
 mod login;
 mod model;
