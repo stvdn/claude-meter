@@ -1,10 +1,11 @@
-//! claude.ai usage API: HTTP client plus pure parsing functions.
+//! The `UsageSource` adapter for claude.ai: HTTP client plus pure parsing functions.
 //!
 //! The endpoints are the ones claude.ai's own Settings → Usage page calls. They are
 //! not a public, documented API, so parsing is deliberately tolerant: unknown fields
 //! are ignored and a missing window becomes `None` instead of an error.
 
-use crate::model::{Limit, Share, Usage, Window, parse_severity};
+use crate::application::ports::{FetchError, UsageSource};
+use crate::domain::{Level, Limit, Share, Usage, Window};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::time::Duration;
@@ -14,39 +15,26 @@ const BASE: &str = "https://claude.ai";
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 \
                           (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36";
 
-#[derive(Debug, Clone, PartialEq, thiserror::Error)]
-pub enum ApiError {
-    #[error("not signed in")]
-    NoKey,
-    #[error("sign-in expired")]
-    Unauthorized,
-    #[error("blocked by claude.ai bot protection")]
-    Blocked,
-    #[error("claude.ai returned HTTP {0}")]
-    Http(u16),
-    #[error("network error: {0}")]
-    Network(String),
-    #[error("unexpected response: {0}")]
-    Parse(String),
-}
-
-impl ApiError {
-    /// Errors that a new sign-in fixes, as opposed to ones that retrying fixes.
-    pub fn needs_login(&self) -> bool {
-        matches!(self, ApiError::NoKey | ApiError::Unauthorized)
+/// Map claude.ai's `severity` strings. Unknown words give `None`, so our thresholds decide.
+fn parse_severity(s: &str) -> Option<Level> {
+    match s.to_ascii_lowercase().as_str() {
+        "normal" | "ok" | "low" => Some(Level::Ok),
+        "warning" | "warn" | "elevated" | "approaching" | "medium" => Some(Level::Warn),
+        "critical" | "high" | "exceeded" | "limited" | "blocked" | "error" => Some(Level::Critical),
+        _ => None,
     }
 }
 
 /// Decide what an HTTP response means. Pure, so it's unit-tested.
-pub fn classify(status: u16, cf_mitigated: bool, body: &str) -> Result<(), ApiError> {
+pub fn classify(status: u16, cf_mitigated: bool, body: &str) -> Result<(), FetchError> {
     if (200..300).contains(&status) {
         return Ok(());
     }
     let challenge = cf_mitigated || body.contains("challenge-platform") || body.contains("Just a moment");
     match status {
-        _ if challenge => Err(ApiError::Blocked),
-        401 | 403 => Err(ApiError::Unauthorized),
-        s => Err(ApiError::Http(s)),
+        _ if challenge => Err(FetchError::Blocked),
+        401 | 403 => Err(FetchError::Unauthorized),
+        s => Err(FetchError::Http(s)),
     }
 }
 
@@ -58,14 +46,14 @@ pub fn classify(status: u16, cf_mitigated: bool, body: &str) -> Result<(), ApiEr
 /// ```
 /// `five_hour`/`seven_day` give the precise percentages; `limits` adds claude.ai's severity
 /// and any extra limits (e.g. a weekly cap on one model). Either source alone is enough.
-pub fn parse_usage(body: &str) -> Result<Usage, ApiError> {
-    let v: Value = serde_json::from_str(body).map_err(|e| ApiError::Parse(e.to_string()))?;
+pub fn parse_usage(body: &str) -> Result<Usage, FetchError> {
+    let v: Value = serde_json::from_str(body).map_err(|e| FetchError::Parse(e.to_string()))?;
     let mut limits = parse_limits(&v);
     let mut take = |kind: &str| limits.iter().position(|l| l.kind == kind).map(|i| limits.remove(i).window);
     let session = merge(parse_window(&v, "five_hour"), take("session"));
     let weekly = merge(parse_window(&v, "seven_day"), take("weekly_all"));
     if session.is_none() && weekly.is_none() {
-        return Err(ApiError::Parse("no session or weekly limit in response".into()));
+        return Err(FetchError::Parse("no session or weekly limit in response".into()));
     }
     Ok(Usage { session, weekly, others: limits, breakdown: parse_breakdown(&v) })
 }
@@ -134,9 +122,9 @@ fn parse_breakdown(v: &Value) -> Vec<Share> {
 
 /// Parse `/api/organizations` and pick the org to read usage from.
 /// Prefers an org that can chat (the personal Pro org); falls back to the first one.
-pub fn parse_org_id(body: &str) -> Result<String, ApiError> {
-    let v: Value = serde_json::from_str(body).map_err(|e| ApiError::Parse(e.to_string()))?;
-    let orgs = v.as_array().ok_or_else(|| ApiError::Parse("organizations is not a list".into()))?;
+pub fn parse_org_id(body: &str) -> Result<String, FetchError> {
+    let v: Value = serde_json::from_str(body).map_err(|e| FetchError::Parse(e.to_string()))?;
+    let orgs = v.as_array().ok_or_else(|| FetchError::Parse("organizations is not a list".into()))?;
     let can_chat = |o: &&Value| {
         o.get("capabilities")
             .and_then(Value::as_array)
@@ -146,26 +134,26 @@ pub fn parse_org_id(body: &str) -> Result<String, ApiError> {
     let id = org
         .and_then(|o| o.get("uuid"))
         .and_then(Value::as_str)
-        .ok_or_else(|| ApiError::Parse("no organization uuid".into()))?;
+        .ok_or_else(|| FetchError::Parse("no organization uuid".into()))?;
     // The id goes into a URL path, so only accept UUID characters.
     if id.is_empty() || !id.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
-        return Err(ApiError::Parse("organization uuid has unexpected characters".into()));
+        return Err(FetchError::Parse("organization uuid has unexpected characters".into()));
     }
     Ok(id.to_string())
 }
 
 /// Blocking HTTP client. One request a minute doesn't need an async runtime.
-pub struct Client {
+pub struct ClaudeApi {
     agent: ureq::Agent,
 }
 
-impl Default for Client {
+impl Default for ClaudeApi {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Client {
+impl ClaudeApi {
     pub fn new() -> Self {
         let config = ureq::Agent::config_builder()
             .timeout_global(Some(Duration::from_secs(20)))
@@ -175,42 +163,44 @@ impl Client {
         Self { agent: config.into() }
     }
 
-    fn get(&self, path: &str, session_key: &str) -> Result<String, ApiError> {
+    fn get(&self, path: &str, session_key: &str) -> Result<String, FetchError> {
         let mut resp = self
             .agent
             .get(format!("{BASE}{path}"))
             .header("Cookie", format!("sessionKey={session_key}"))
             .header("Accept", "application/json")
             .call()
-            .map_err(|e| ApiError::Network(e.to_string()))?;
+            .map_err(|e| FetchError::Network(e.to_string()))?;
         let status = resp.status().as_u16();
         let cf_mitigated = resp.headers().contains_key("cf-mitigated");
         let body = resp
             .body_mut()
             .read_to_string()
-            .map_err(|e| ApiError::Network(e.to_string()))?;
+            .map_err(|e| FetchError::Network(e.to_string()))?;
         classify(status, cf_mitigated, &body)?;
         Ok(body)
     }
 
-    pub fn org_id(&self, session_key: &str) -> Result<String, ApiError> {
+}
+
+impl UsageSource for ClaudeApi {
+    fn org_id(&self, session_key: &str) -> Result<String, FetchError> {
         parse_org_id(&self.get("/api/organizations", session_key)?)
     }
 
-    /// Raw JSON of the usage endpoint (what `--once` prints).
-    pub fn usage_raw(&self, session_key: &str, org_id: &str) -> Result<String, ApiError> {
+    fn usage_raw(&self, session_key: &str, org_id: &str) -> Result<String, FetchError> {
         self.get(&format!("/api/organizations/{org_id}/usage?via=plan"), session_key)
     }
 
-    pub fn usage(&self, session_key: &str, org_id: &str) -> Result<Usage, ApiError> {
-        parse_usage(&self.usage_raw(session_key, org_id)?)
+    fn parse_usage(&self, raw: &str) -> Result<Usage, FetchError> {
+        parse_usage(raw)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Level;
+    use crate::domain::Level;
 
     #[test]
     fn parses_both_windows() {
@@ -282,7 +272,7 @@ mod tests {
         let w = u.weekly.unwrap();
         assert_eq!((w.percent, w.severity), (40.0, None));
         assert_eq!(u.others.len(), 1);
-        assert_eq!(u.others[0].label(), "Week · Opus");
+        assert_eq!(u.others[0].kind, "weekly_opus");
         assert_eq!(u.others[0].window.level(), Level::Warn);
         assert!(u.others[0].window.resets_at.is_some());
     }
@@ -296,8 +286,8 @@ mod tests {
 
     #[test]
     fn missing_windows_is_an_error() {
-        assert!(matches!(parse_usage(r#"{"foo": 1}"#), Err(ApiError::Parse(_))));
-        assert!(matches!(parse_usage("<html>"), Err(ApiError::Parse(_))));
+        assert!(matches!(parse_usage(r#"{"foo": 1}"#), Err(FetchError::Parse(_))));
+        assert!(matches!(parse_usage("<html>"), Err(FetchError::Parse(_))));
     }
 
     #[test]
@@ -320,12 +310,20 @@ mod tests {
     #[test]
     fn classifies_responses() {
         assert_eq!(classify(200, false, "{}"), Ok(()));
-        assert_eq!(classify(401, false, "{}"), Err(ApiError::Unauthorized));
-        assert_eq!(classify(403, false, r#"{"error":"x"}"#), Err(ApiError::Unauthorized));
-        assert_eq!(classify(403, true, ""), Err(ApiError::Blocked));
-        assert_eq!(classify(403, false, "<title>Just a moment...</title>"), Err(ApiError::Blocked));
-        assert_eq!(classify(500, false, ""), Err(ApiError::Http(500)));
-        assert!(ApiError::Unauthorized.needs_login());
-        assert!(!ApiError::Http(500).needs_login());
+        assert_eq!(classify(401, false, "{}"), Err(FetchError::Unauthorized));
+        assert_eq!(classify(403, false, r#"{"error":"x"}"#), Err(FetchError::Unauthorized));
+        assert_eq!(classify(403, true, ""), Err(FetchError::Blocked));
+        assert_eq!(classify(403, false, "<title>Just a moment...</title>"), Err(FetchError::Blocked));
+        assert_eq!(classify(500, false, ""), Err(FetchError::Http(500)));
+        assert!(FetchError::Unauthorized.needs_login());
+        assert!(!FetchError::Http(500).needs_login());
+    }
+
+    #[test]
+    fn maps_severity_words() {
+        assert_eq!(parse_severity("normal"), Some(Level::Ok));
+        assert_eq!(parse_severity("Warning"), Some(Level::Warn));
+        assert_eq!(parse_severity("exceeded"), Some(Level::Critical));
+        assert_eq!(parse_severity("brand_new"), None);
     }
 }

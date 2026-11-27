@@ -1,7 +1,7 @@
 //! The floating badge: a small always-on-top window with the session and weekly bars.
 //! Drag it anywhere with the left button; right-click opens the same menu as the tray icon.
 
-use crate::render::{self, BadgeRow};
+use super::render::{self, BadgeRow};
 use anyhow::{Context, Result, anyhow};
 use softbuffer::Surface;
 use std::num::NonZeroU32;
@@ -14,7 +14,7 @@ use tao::window::{Window, WindowBuilder, WindowId};
 /// What the badge shows; owned so it can be redrawn on demand (DPI changes, expose).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Content {
-    pub rows: Vec<(String, f32, crate::model::Level)>,
+    pub rows: Vec<(String, f32, crate::domain::Level)>,
     pub stale: bool,
     pub note: Option<String>,
 }
