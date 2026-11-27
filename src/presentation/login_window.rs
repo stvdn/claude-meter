@@ -5,7 +5,7 @@
 //! cookie, the app reads it from the webview's cookie store and the window is closed.
 //! The webview (and its ~50 MB of browser processes) only exists while this window is open.
 
-use crate::config;
+use std::path::Path;
 use anyhow::{Context, Result};
 use tao::dpi::LogicalSize;
 use tao::event_loop::EventLoopWindowTarget;
@@ -56,7 +56,7 @@ pub struct LoginWindow {
 }
 
 impl LoginWindow {
-    pub fn open<T: 'static>(target: &EventLoopWindowTarget<T>, reject: Option<String>) -> Result<Self> {
+    pub fn open<T: 'static>(target: &EventLoopWindowTarget<T>, profile: &Path, reject: Option<String>) -> Result<Self> {
         let window = WindowBuilder::new()
             .with_title("Sign in to Claude · claude-meter")
             .with_inner_size(LogicalSize::new(480.0, 720.0))
@@ -64,7 +64,7 @@ impl LoginWindow {
             .context("creating the sign-in window")?;
         // Own browser profile, so the person's other browsers are untouched and the
         // sign-in survives restarts (re-login is usually one click).
-        let mut context = WebContext::new(Some(config::data_dir().join("webview")));
+        let mut context = WebContext::new(Some(profile.to_path_buf()));
         let mut builder = WebViewBuilder::new_with_web_context(&mut context)
             .with_url(LOGIN_URL)
             .with_additional_browser_args(BROWSER_ARGS)
@@ -107,8 +107,8 @@ impl LoginWindow {
 
 /// Sign-out: forget the login window's browser profile too. Best effort, since
 /// WebView2 can hold files open for a moment after its window closes.
-pub fn clear_profile() {
-    let _ = std::fs::remove_dir_all(config::data_dir().join("webview"));
+pub fn clear_profile(profile: &Path) {
+    let _ = std::fs::remove_dir_all(profile);
 }
 
 #[cfg(test)]

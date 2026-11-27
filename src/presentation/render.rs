@@ -3,7 +3,8 @@
 //! Text uses a font that ships with Windows (Segoe UI), read from disk once, so the
 //! binary carries no font. If no font can be loaded the pictures still draw, without text.
 
-use crate::model::{Level, Usage, percent_label};
+use super::format::percent_label;
+use crate::domain::{Level, Usage};
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont, point};
 use std::sync::OnceLock;
 use tiny_skia::{Color, FillRule, Paint, PathBuilder, Pixmap, Rect, Transform};
